@@ -6,7 +6,7 @@ import {
   CheckCircle2,
   Eye,
   EyeOff,
-  SlidersHorizontal,
+  RefreshCw,
   Volume2,
   XCircle,
 } from 'lucide-react';
@@ -22,9 +22,10 @@ import { SyllableBuilder } from './components/SyllableBuilder';
 import { ExceptionsMasterclass } from './components/ExceptionsMasterclass';
 import { ListeningLab } from './components/ListeningLab';
 import {
-  AudioEnginePreference,
-  getKoreanVoices,
+  getAllKoreanVoiceChoices,
+  GOOGLE_HD_VOICE_ID,
   isSpeechSupported,
+  KoreanVoiceChoice,
   playFeedbackTone,
   speakKorean,
 } from './utils/speech';
@@ -38,14 +39,13 @@ export default function App() {
   const [selectedModuleId, setSelectedModuleId] = useState<ModuleId>('vowels_basic');
   const [selectedLetterId, setSelectedLetterId] = useState<string>('a');
 
-  const [speechRate, setSpeechRate] = useState<number>(0.85);
-  const [audioPreference, setAudioPreference] = useState<AudioEnginePreference>('auto');
-  const [lastEngineUsed, setLastEngineUsed] = useState<'system' | 'synth' | null>(null);
-  const [koreanVoices, setKoreanVoices] = useState<SpeechSynthesisVoice[]>([]);
-  const [selectedVoiceURI, setSelectedVoiceURI] = useState<string>('');
+  const [speechRate, setSpeechRate] = useState<number>(1.0);
+  const [voiceChoices, setVoiceChoices] = useState<KoreanVoiceChoice[]>(() =>
+    getAllKoreanVoiceChoices()
+  );
+  const [selectedVoiceId, setSelectedVoiceId] = useState<string>(GOOGLE_HD_VOICE_ID);
   const [activeSpeakKey, setActiveSpeakKey] = useState<string | null>(null);
   const [speechError, setSpeechError] = useState<string | null>(null);
-  const [showAudioConfig, setShowAudioConfig] = useState<boolean>(false);
 
   const [hideReadings, setHideReadings] = useState<boolean>(false);
   const [lessonQuizChoice, setLessonQuizChoice] = useState<number | null>(null);
@@ -70,23 +70,22 @@ export default function App() {
     }
   }, [completedIds]);
 
-  useEffect(() => {
-    const loadVoices = () => {
-      const voices = getKoreanVoices();
-      setKoreanVoices(voices);
-      if (voices.length > 0 && !selectedVoiceURI) {
-        setSelectedVoiceURI(voices[0].voiceURI);
-      }
-    };
+  const refreshVoices = useCallback(() => {
+    const choices = getAllKoreanVoiceChoices();
+    setVoiceChoices(choices);
+  }, []);
 
-    loadVoices();
+  useEffect(() => {
+    refreshVoices();
     if (isSpeechSupported()) {
-      window.speechSynthesis.addEventListener('voiceschanged', loadVoices);
+      window.speechSynthesis.addEventListener('voiceschanged', refreshVoices);
+      const timer = setTimeout(refreshVoices, 600);
       return () => {
-        window.speechSynthesis.removeEventListener('voiceschanged', loadVoices);
+        clearTimeout(timer);
+        window.speechSynthesis.removeEventListener('voiceschanged', refreshVoices);
       };
     }
-  }, [selectedVoiceURI]);
+  }, [refreshVoices]);
 
   // Reset per-letter quiz when changing letter
   useEffect(() => {
@@ -98,10 +97,8 @@ export default function App() {
       setSpeechError(null);
       speakKorean(text, {
         rate: speechRate,
-        voiceURI: selectedVoiceURI || undefined,
-        engine: audioPreference,
+        voiceId: selectedVoiceId,
         callbacks: {
-          onEngineUsed: (engine) => setLastEngineUsed(engine),
           onStart: () => setActiveSpeakKey(key ?? text),
           onEnd: () => setActiveSpeakKey(null),
           onError: (msg) => {
@@ -111,7 +108,7 @@ export default function App() {
         },
       });
     },
-    [speechRate, selectedVoiceURI, audioPreference]
+    [speechRate, selectedVoiceId]
   );
 
   const activeModule = useMemo(
@@ -170,18 +167,7 @@ export default function App() {
 
   const isCompleted = completedIds.includes(activeLetter.id);
 
-  const hasLocalKo = koreanVoices.some((v) => v.localService);
-
-  const audioStatusLabel =
-    audioPreference === 'synth' || (audioPreference === 'auto' && !hasLocalKo)
-      ? 'Audio locale attivo (funziona sempre senza pacchetti esterni)'
-      : lastEngineUsed === 'synth'
-      ? 'Audio locale attivo (voce sistema non disponibile)'
-      : `Voce coreana di sistema: ${
-          koreanVoices.find((v) => v.voiceURI === selectedVoiceURI)?.name ??
-          koreanVoices[0]?.name ??
-          'ko-KR'
-        }`;
+  const deviceVoicesCount = voiceChoices.filter((c) => c.provider === 'device').length;
 
   return (
     <div className="min-h-screen flex flex-col bg-[#E5EBF3] text-[#0F172A]">
@@ -232,17 +218,14 @@ export default function App() {
           <div className="shrink-0">
             <button
               type="button"
-              onClick={() => {
-                playFeedbackTone('correct');
-                handleSpeak('아 가 나 다', 'header-test');
-              }}
+              onClick={() => handleSpeak('안녕하세요', 'header-test')}
               className={`px-4 py-2 text-xs sm:text-sm font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                 activeSpeakKey === 'header-test'
                   ? 'bg-[#D97706] text-white'
                   : 'bg-[#0284C7] hover:bg-[#0369A1] text-white'
               }`}
             >
-              Prova Audio Coreano
+              Prova Voce Coreana
             </button>
           </div>
         </div>
@@ -278,40 +261,47 @@ export default function App() {
 
       {/* Main Content Container */}
       <main className="flex-1 max-w-[1280px] w-full mx-auto px-4 sm:px-6 py-6 sm:py-8 space-y-8">
-        {/* Audio & Progress Bar (cleanly framed, never blends into background) */}
-        <div className="bg-white border-2 border-slate-300 rounded-2xl px-5 py-4 flex flex-wrap items-center justify-between gap-4 shadow-sm">
+        {/* Visible Google & Android Voice Selector Bar */}
+        <div className="bg-white border-2 border-slate-300 rounded-2xl px-5 py-4 flex flex-col lg:flex-row lg:items-center justify-between gap-4 shadow-sm">
           <div className="flex flex-wrap items-center gap-2.5 text-sm text-slate-700">
             <span className="font-bold text-slate-900">
               Progresso: {completedIds.length}/40 lettere
             </span>
             <span aria-hidden="true">·</span>
-            <span className="text-slate-700 font-medium">{audioStatusLabel}</span>
+            <span className="text-slate-600">
+              Voci dispositivo ko-KR rilevate: {deviceVoicesCount}
+            </span>
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
-            {/* Direct Engine Toggle */}
-            <div className="flex items-center gap-1 p-1 bg-slate-200 rounded-xl">
+            {/* Voice Picker: Google & Android */}
+            <div className="flex items-center gap-2">
+              <label
+                htmlFor="korean-voice-picker"
+                className="text-sm font-bold text-slate-900 whitespace-nowrap"
+              >
+                Voce:
+              </label>
+              <select
+                id="korean-voice-picker"
+                value={selectedVoiceId}
+                onChange={(e) => setSelectedVoiceId(e.target.value)}
+                className="px-3 py-2 text-sm font-semibold text-slate-900 bg-slate-50 border-2 border-slate-300 hover:border-[#0284C7] rounded-xl max-w-[290px] cursor-pointer"
+              >
+                {voiceChoices.map((choice) => (
+                  <option key={choice.id} value={choice.id}>
+                    {choice.label}
+                  </option>
+                ))}
+              </select>
               <button
                 type="button"
-                onClick={() => setAudioPreference('synth')}
-                className={`px-3 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                  audioPreference === 'synth' || (audioPreference === 'auto' && !hasLocalKo)
-                    ? 'bg-white text-slate-900 shadow-sm'
-                    : 'text-slate-700 hover:text-slate-900'
-                }`}
+                onClick={refreshVoices}
+                title="Aggiorna elenco voci Android e dispositivo"
+                aria-label="Aggiorna elenco voci Android e dispositivo"
+                className="p-2 text-slate-700 bg-slate-100 border border-slate-300 hover:bg-slate-200 rounded-xl cursor-pointer shrink-0"
               >
-                Audio Locale
-              </button>
-              <button
-                type="button"
-                onClick={() => setAudioPreference('system')}
-                className={`px-3 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                  audioPreference === 'system' || (audioPreference === 'auto' && hasLocalKo)
-                    ? 'bg-white text-slate-900 shadow-sm'
-                    : 'text-slate-700 hover:text-slate-900'
-                }`}
-              >
-                Voce Sistema ({koreanVoices.length})
+                <RefreshCw className="w-4 h-4" />
               </button>
             </div>
 
@@ -319,103 +309,33 @@ export default function App() {
             <div className="flex items-center gap-1 p-1 bg-slate-200 rounded-xl">
               <button
                 type="button"
-                onClick={() => setSpeechRate(0.65)}
+                onClick={() => setSpeechRate(0.75)}
                 className={`px-3 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                  speechRate < 0.75
+                  speechRate < 0.85
                     ? 'bg-white text-slate-900 shadow-sm'
                     : 'text-slate-700 hover:text-slate-900'
                 }`}
               >
-                Lento 0.65x
+                Lento
               </button>
               <button
                 type="button"
-                onClick={() => setSpeechRate(0.9)}
+                onClick={() => setSpeechRate(1.0)}
                 className={`px-3 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                  speechRate >= 0.75
+                  speechRate >= 0.85
                     ? 'bg-white text-slate-900 shadow-sm'
                     : 'text-slate-700 hover:text-slate-900'
                 }`}
               >
-                Naturale 0.90x
+                Naturale
               </button>
             </div>
-
-            <button
-              type="button"
-              onClick={() => setShowAudioConfig((s) => !s)}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs sm:text-sm font-semibold text-slate-800 bg-slate-100 border border-slate-300 hover:bg-slate-200 rounded-xl whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              <SlidersHorizontal className="w-4 h-4" />
-              Opzioni
-            </button>
           </div>
         </div>
 
-        {/* Audio Settings Drawer */}
-        {showAudioConfig && (
-          <div className="bg-white border-2 border-[#0284C7] rounded-2xl p-5 space-y-4 shadow-sm">
-            <div className="flex flex-wrap items-center justify-between gap-4">
-              <div>
-                <h3 className="text-base font-bold text-slate-900">
-                  Motore audio coreano (100% locale, senza AI)
-                </h3>
-                <p className="text-sm text-slate-600 mt-1">
-                  In modalità <strong>Automatico</strong> l’app usa la voce coreana del tuo dispositivo (se installata) e passa automaticamente al sintetizzatore fonetico locale se il browser blocca o non possiede la voce coreana.
-                </p>
-              </div>
-              <div className="flex flex-wrap items-center gap-1.5 p-1 bg-slate-200 rounded-xl">
-                {(
-                  [
-                    { id: 'auto', label: 'Automatico' },
-                    { id: 'system', label: 'Solo voce sistema' },
-                    { id: 'synth', label: 'Sintetizzatore locale' },
-                  ] as const
-                ).map((opt) => (
-                  <button
-                    key={opt.id}
-                    type="button"
-                    onClick={() => setAudioPreference(opt.id)}
-                    className={`px-3 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                      audioPreference === opt.id
-                        ? 'bg-[#0284C7] text-white'
-                        : 'text-slate-700 hover:text-slate-900'
-                    }`}
-                  >
-                    {opt.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {koreanVoices.length > 0 && (
-              <div className="flex flex-wrap items-center gap-3 pt-3 border-t border-slate-200">
-                <label
-                  htmlFor="ko-voice-select"
-                  className="text-sm font-semibold text-slate-800"
-                >
-                  Voce di sistema ko-KR:
-                </label>
-                <select
-                  id="ko-voice-select"
-                  value={selectedVoiceURI}
-                  onChange={(e) => setSelectedVoiceURI(e.target.value)}
-                  className="px-3 py-2 text-sm font-medium text-slate-900 bg-slate-50 border border-slate-300 rounded-xl"
-                >
-                  {koreanVoices.map((v) => (
-                    <option key={v.voiceURI} value={v.voiceURI}>
-                      {v.name} ({v.lang})
-                    </option>
-                  ))}
-                </select>
-              </div>
-            )}
-          </div>
-        )}
-
         {speechError && (
           <div className="bg-amber-50 border-2 border-amber-400 rounded-2xl p-4 text-base text-slate-900">
-            <strong className="font-bold">Nota audio:</strong> {speechError} Prova a selezionare <strong>Sintetizzatore locale</strong> nelle Impostazioni audio qui sopra.
+            <strong className="font-bold">Nota audio:</strong> {speechError}
           </div>
         )}
 

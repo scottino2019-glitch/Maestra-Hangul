@@ -1,13 +1,17 @@
-import { synthesizeKoreanAudio, unlockAudioContext } from './hangulSynth';
-
-export type AudioEnginePreference = 'auto' | 'system' | 'synth';
-
 export interface SpeechCallbacks {
   onStart?: () => void;
   onEnd?: () => void;
   onError?: (reason: string) => void;
-  onEngineUsed?: (engine: 'system' | 'synth') => void;
 }
+
+export interface KoreanVoiceChoice {
+  id: string;
+  label: string;
+  provider: 'google-hd' | 'device';
+  voice?: SpeechSynthesisVoice;
+}
+
+export const GOOGLE_HD_VOICE_ID = 'google-tts-hd';
 
 export const CHOSEONG_LIST = [
   'ㄱ', 'ㄲ', 'ㄴ', 'ㄷ', 'ㄸ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅃ', 'ㅅ',
@@ -41,12 +45,36 @@ export function composeHangul(initial: string, medial: string, final = ''): stri
 let cachedVoices: SpeechSynthesisVoice[] = [];
 let currentUtterance: SpeechSynthesisUtterance | null = null;
 let speakTimer: ReturnType<typeof setTimeout> | null = null;
-let watchdogTimer: ReturnType<typeof setTimeout> | null = null;
+let currentAudio: HTMLAudioElement | null = null;
+
+export function isSpeechSupported(): boolean {
+  return typeof window !== 'undefined' && 'speechSynthesis' in window;
+}
+
+function formatDeviceVoiceLabel(v: SpeechSynthesisVoice): string {
+  const lower = `${v.name} ${v.voiceURI}`.toLowerCase();
+  if (lower.includes('google') && (lower.includes('ko-kr') || lower.includes('android') || lower.includes('x-'))) {
+    return `Android / Google — ${v.name}`;
+  }
+  if (lower.includes('google')) {
+    return `Google Browser — ${v.name}`;
+  }
+  if (lower.includes('samsung')) {
+    return `Android Samsung — ${v.name}`;
+  }
+  return `Dispositivo — ${v.name} (${v.lang})`;
+}
+
+function voicePriority(v: SpeechSynthesisVoice): number {
+  const lower = `${v.name} ${v.voiceURI}`.toLowerCase();
+  if (lower.includes('google')) return 0;
+  if (lower.includes('samsung') || lower.includes('android')) return 1;
+  if (lower.includes('yuna') || lower.includes('sora') || lower.includes('heami')) return 2;
+  return 3;
+}
 
 export function getKoreanVoices(): SpeechSynthesisVoice[] {
-  if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
-    return [];
-  }
+  if (!isSpeechSupported()) return [];
   const voices = window.speechSynthesis.getVoices();
   if (voices.length > 0) {
     cachedVoices = voices;
@@ -63,12 +91,29 @@ export function getKoreanVoices(): SpeechSynthesisVoice[] {
       name.includes('한국')
     );
   });
-  // Prefer local OS voices over remote cloud voices (which often fail silently inside iframes)
-  return ko.sort((a, b) => Number(b.localService) - Number(a.localService));
+  return ko.sort((a, b) => voicePriority(a) - voicePriority(b));
 }
 
-export function isSpeechSupported(): boolean {
-  return typeof window !== 'undefined' && 'speechSynthesis' in window;
+export function getAllKoreanVoiceChoices(): KoreanVoiceChoice[] {
+  const choices: KoreanVoiceChoice[] = [
+    {
+      id: GOOGLE_HD_VOICE_ID,
+      label: 'Google Coreano (Voce Naturale HD)',
+      provider: 'google-hd',
+    },
+  ];
+
+  const deviceVoices = getKoreanVoices();
+  for (const v of deviceVoices) {
+    choices.push({
+      id: v.voiceURI,
+      label: formatDeviceVoiceLabel(v),
+      provider: 'device',
+      voice: v,
+    });
+  }
+
+  return choices;
 }
 
 export function stopKoreanSpeech(): void {
@@ -76,9 +121,10 @@ export function stopKoreanSpeech(): void {
     clearTimeout(speakTimer);
     speakTimer = null;
   }
-  if (watchdogTimer) {
-    clearTimeout(watchdogTimer);
-    watchdogTimer = null;
+  if (currentAudio) {
+    currentAudio.pause();
+    currentAudio.currentTime = 0;
+    currentAudio = null;
   }
   currentUtterance = null;
   if (isSpeechSupported()) {
@@ -86,151 +132,120 @@ export function stopKoreanSpeech(): void {
   }
 }
 
-export function speakKorean(
+function speakWithDeviceVoice(
   text: string,
-  options?: {
-    rate?: number;
-    voiceURI?: string;
-    engine?: AudioEnginePreference;
-    callbacks?: SpeechCallbacks;
-  }
+  rate: number,
+  voice: SpeechSynthesisVoice | undefined,
+  callbacks?: SpeechCallbacks
 ): void {
-  // CRITICAL: Unlock Web Audio synchronously inside user click gesture
-  unlockAudioContext();
-
-  const rate = options?.rate ?? 0.85;
-  const preference = options?.engine ?? 'auto';
-  const callbacks = options?.callbacks;
-
-  stopKoreanSpeech();
-
-  const koVoices = getKoreanVoices();
-  const hasLocalKoVoice = koVoices.some((v) => v.localService);
-  const canUseSystemVoice =
-    isSpeechSupported() &&
-    (preference === 'system' ? koVoices.length > 0 : hasLocalKoVoice);
-
-  if (preference === 'synth' || (preference === 'auto' && !canUseSystemVoice)) {
-    synthesizeKoreanAudio(
-      text,
-      rate,
-      () => {
-        callbacks?.onEngineUsed?.('synth');
-        callbacks?.onStart?.();
-      },
-      () => callbacks?.onEnd?.()
-    ).then((ok) => {
-      if (!ok) {
-        callbacks?.onError?.('Audio del browser non disponibile.');
-        callbacks?.onEnd?.();
-      }
-    });
-    return;
-  }
-
   if (!isSpeechSupported()) {
-    callbacks?.onError?.('Sintesi vocale di sistema non supportata.');
+    callbacks?.onError?.('Sintesi vocale del dispositivo non disponibile.');
+    callbacks?.onEnd?.();
     return;
   }
 
   const synth = window.speechSynthesis;
-  const selectedVoice = options?.voiceURI
-    ? koVoices.find((v) => v.voiceURI === options.voiceURI)
-    : undefined;
-
-  const fallbackToSynth = () => {
-    synthesizeKoreanAudio(
-      text,
-      rate,
-      () => {
-        callbacks?.onEngineUsed?.('synth');
-        callbacks?.onStart?.();
-      },
-      () => callbacks?.onEnd?.()
-    );
-  };
-
-  const triggerSpeak = () => {
+  const trigger = () => {
     const utterance = new SpeechSynthesisUtterance(text);
     currentUtterance = utterance;
     utterance.lang = 'ko-KR';
-    utterance.rate = rate;
+    // Avoid extreme slow stretching on Android/Google TTS
+    utterance.rate = rate < 0.8 ? 0.75 : 1.0;
     utterance.pitch = 1.0;
     utterance.volume = 1.0;
-    if (selectedVoice ?? koVoices[0]) {
-      utterance.voice = selectedVoice ?? koVoices[0];
+    if (voice) {
+      utterance.voice = voice;
     }
 
-    let started = false;
-    let startTimestamp = 0;
-
-    watchdogTimer = setTimeout(() => {
-      if (!started && preference === 'auto') {
-        synth.cancel();
-        currentUtterance = null;
-        fallbackToSynth();
-      }
-    }, 450);
-
-    utterance.onstart = () => {
-      started = true;
-      startTimestamp = Date.now();
-      if (watchdogTimer) {
-        clearTimeout(watchdogTimer);
-        watchdogTimer = null;
-      }
-      callbacks?.onEngineUsed?.('system');
-      callbacks?.onStart?.();
-    };
-
+    utterance.onstart = () => callbacks?.onStart?.();
     utterance.onend = () => {
-      if (watchdogTimer) {
-        clearTimeout(watchdogTimer);
-        watchdogTimer = null;
-      }
       currentUtterance = null;
-
-      // Detect silent Chrome remote-voice failure (started & ended almost instantaneously)
-      const elapsed = startTimestamp > 0 ? Date.now() - startTimestamp : 0;
-      if (preference === 'auto' && (!started || elapsed < 85)) {
-        fallbackToSynth();
-        return;
-      }
       callbacks?.onEnd?.();
     };
-
     utterance.onerror = (event) => {
-      if (watchdogTimer) {
-        clearTimeout(watchdogTimer);
-        watchdogTimer = null;
-      }
       currentUtterance = null;
       if (event.error === 'canceled' || event.error === 'interrupted') {
         callbacks?.onEnd?.();
         return;
       }
-      if (preference === 'auto') {
-        fallbackToSynth();
-      } else {
-        callbacks?.onError?.('La voce coreana di sistema non risponde.');
-        callbacks?.onEnd?.();
-      }
+      callbacks?.onError?.(
+        'La voce selezionata sul dispositivo non ha risposto. Prova la voce Google Coreano HD.'
+      );
+      callbacks?.onEnd?.();
     };
 
     try {
       synth.resume();
       synth.speak(utterance);
     } catch {
-      fallbackToSynth();
+      callbacks?.onError?.('Impossibile avviare la voce del dispositivo.');
+      callbacks?.onEnd?.();
     }
   };
 
   if (synth.speaking || synth.pending) {
     synth.cancel();
-    speakTimer = setTimeout(triggerSpeak, 60);
+    speakTimer = setTimeout(trigger, 60);
   } else {
-    triggerSpeak();
+    trigger();
   }
+}
+
+export function speakKorean(
+  text: string,
+  options?: {
+    rate?: number;
+    voiceId?: string;
+    callbacks?: SpeechCallbacks;
+  }
+): void {
+  const rate = options?.rate ?? 1.0;
+  const voiceId = options?.voiceId ?? GOOGLE_HD_VOICE_ID;
+  const callbacks = options?.callbacks;
+
+  stopKoreanSpeech();
+
+  if (voiceId === GOOGLE_HD_VOICE_ID) {
+    const audio = new Audio(`/api/tts?q=${encodeURIComponent(text)}`);
+    currentAudio = audio;
+    audio.playbackRate = rate < 0.8 ? 0.74 : 1.0;
+
+    audio.onplay = () => callbacks?.onStart?.();
+    audio.onended = () => {
+      if (currentAudio === audio) {
+        currentAudio = null;
+      }
+      callbacks?.onEnd?.();
+    };
+    audio.onerror = () => {
+      if (currentAudio === audio) {
+        currentAudio = null;
+      }
+      // Graceful fallback to first Google/Android device voice if network TTS fails
+      const deviceVoices = getKoreanVoices();
+      if (deviceVoices.length > 0) {
+        speakWithDeviceVoice(text, rate, deviceVoices[0], callbacks);
+      } else {
+        callbacks?.onError?.('Voce Google non raggiungibile e nessuna voce ko-KR trovata sul dispositivo.');
+        callbacks?.onEnd?.();
+      }
+    };
+
+    audio.play().catch(() => {
+      const deviceVoices = getKoreanVoices();
+      if (deviceVoices.length > 0) {
+        speakWithDeviceVoice(text, rate, deviceVoices[0], callbacks);
+      } else {
+        callbacks?.onError?.('Riproduzione bloccata dal browser. Tocca di nuovo per ascoltare.');
+        callbacks?.onEnd?.();
+      }
+    });
+    return;
+  }
+
+  const deviceVoices = getKoreanVoices();
+  const matched = deviceVoices.find((v) => v.voiceURI === voiceId) ?? deviceVoices[0];
+  speakWithDeviceVoice(text, rate, matched, callbacks);
 }
 
 export function playFeedbackTone(type: 'correct' | 'retry'): void {
@@ -252,7 +267,7 @@ export function playFeedbackTone(type: 'correct' | 'retry'): void {
           osc.type = 'sine';
           osc.frequency.setValueAtTime(freq, now + idx * 0.08);
           gain.gain.setValueAtTime(0.001, now + idx * 0.08);
-          gain.gain.exponentialRampToValueAtTime(0.28, now + idx * 0.08 + 0.02);
+          gain.gain.exponentialRampToValueAtTime(0.22, now + idx * 0.08 + 0.02);
           gain.gain.exponentialRampToValueAtTime(0.001, now + idx * 0.08 + 0.24);
           osc.connect(gain);
           gain.connect(ctx.destination);
@@ -266,7 +281,7 @@ export function playFeedbackTone(type: 'correct' | 'retry'): void {
         osc.frequency.setValueAtTime(320, now);
         osc.frequency.linearRampToValueAtTime(220, now + 0.18);
         gain.gain.setValueAtTime(0.001, now);
-        gain.gain.exponentialRampToValueAtTime(0.24, now + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.18, now + 0.02);
         gain.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
         osc.connect(gain);
         gain.connect(ctx.destination);
